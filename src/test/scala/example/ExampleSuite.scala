@@ -95,6 +95,7 @@ class ExampleSuite
             } *> log.get
 
         }.asserting { log =>
+          log should not contain "got session for select"
           log shouldBe List(
             "getting session for sleep",
             "getting session for sleep",
