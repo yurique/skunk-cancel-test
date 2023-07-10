@@ -1,6 +1,7 @@
 package example
 
 import cats.effect._
+import cats.effect.std.CountDownLatch
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all._
 import com.dimafeng.testcontainers.ForAllTestContainer
@@ -40,74 +41,82 @@ class ExampleSuite
   "skunk session pool" - {
     "cancels during waiting" in {
 
-      IO.ref(List.empty[String]).flatMap { log =>
+      (
+        IO.ref(List.empty[String]),
+        CountDownLatch[IO](2),
+        CountDownLatch[IO](1)
+      ).flatMapN { case (log, sleepLatch, selectLatch) =>
+        def addLog(s: String): IO[Unit] =
+          logger.info(s) *>
+            log.update(_ :+ s)
 
-          def addLog(s: String): IO[Unit] =
-            logger.info(s) *>
-              log.update(_ :+ s)
+        Session
+          .pooled[IO](
+            host = container.host,
+            port = container.mappedPort(5432),
+            user = container.username,
+            password = container.password.some,
+            database = container.databaseName,
+            max = 2
+          ).use { sessions =>
 
-          Session
-            .pooled[IO](
-              host = container.host,
-              port = container.mappedPort(5432),
-              user = container.username,
-              password = container.password.some,
-              database = container.databaseName,
-              max = 2
-            ).use { sessions =>
+            def sleep =
+              addLog(s"getting session for sleep") *>
+                sessions.use { s =>
+                  addLog("got session for sleep") *>
+                    sleepLatch.release *>
+                    s.execute(
+                      sql"""select 1 from (select pg_sleep(1)) s""".query(int4)
+                    ) <* addLog("sleep done")
+                }
 
-              def sleep =
-                addLog(s"getting session for sleep") *>
-                  sessions.use { s =>
-                    addLog("got session for sleep") *>
-                      s.execute(
-                        sql"""select 1 from (select pg_sleep(1)) s""".query(int4)
-                      ) <* addLog("sleep done")
-                  }
-
-              def select =
-                IO.sleep(100.milliseconds) *> // make sure the sleeps get their chance to grab their sessions first
-                  addLog(s"getting session for select") *>
-                  sessions.use { s =>
-                    addLog("got session for select") *>
-                      s
-                        .execute(
-                          sql"""select 1""".query(int4)
-                        )
-                        .flatTap { result =>
-                          addLog(s"select result: $result")
-                        }
-                  }
-
-              (
-                sleep,
-                sleep, // all two sessions will be busy until the sleeps are done
-                select.start
-                  .flatMap { fio =>
-                    IO.sleep(200.milliseconds) *>
-                      addLog("cancelling select") *>
-                      fio.cancel *>
-                      fio.join.flatMap { outcome =>
-                        addLog(s"select outcome: $outcome")
+            def select = {
+              sleepLatch.await *> // make sure the sleeps get their chance to grab their sessions first
+                addLog(s"getting session for select") *>
+                selectLatch.release *>
+                sessions.use { s =>
+                  addLog("got session for select") *>
+                    s
+                      .execute(
+                        sql"""select 1""".query(int4)
+                      )
+                      .flatTap { result =>
+                        addLog(s"select result: $result")
                       }
-                  }
-              ).parTupled
-            } *> log.get
+                }
+            }
 
-        }.asserting { log =>
+            (
+              sleep,
+              sleep, // all two sessions will be busy until the sleeps are done
+              select.start
+                .flatMap { fio =>
+                  selectLatch.await *> // make sure we are waiting for the session
+                    IO.sleep(200.milliseconds) *>
+                    addLog("cancelling select") *>
+                    fio.cancel *>
+                    fio.join.flatMap { outcome =>
+                      addLog(s"select outcome: $outcome")
+                    }
+                }
+            ).parTupled
+          } *> log.get
+
+      }.asserting { log =>
           log should not contain "got session for select"
           log shouldBe List(
             "getting session for sleep",
             "getting session for sleep",
+            "got session for sleep",
+            "got session for sleep",
             "getting session for select",
-            "got session for sleep",
-            "got session for sleep",
             "cancelling select",
             "select outcome: Canceled()",
             "sleep done",
             "sleep done",
           )
         }
+
     }
   }
 
