@@ -61,7 +61,7 @@ class ExampleSuite
                   sessions.use { s =>
                     addLog("got session for sleep") *>
                       s.execute(
-                        sql"""select 1 from (select pg_sleep(5)) s""".query(int4)
+                        sql"""select 1 from (select pg_sleep(1)) s""".query(int4)
                       ) <* addLog("sleep done")
                   }
 
